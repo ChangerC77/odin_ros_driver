@@ -23,8 +23,11 @@ limitations under the License.
 #include <memory>
 #include <opencv2/opencv.hpp>
 #include <deque> 
+#include <queue>
 #include <unistd.h> 
 #include <cstdlib>
+#include <sched.h>
+#include <pthread.h>
 #include <cstring>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -46,7 +49,7 @@ limitations under the License.
     #include <ros/package.h>
     #include <ros/ros.h> 
 #endif
-#define ros_driver_version "0.9.0"
+#define ros_driver_version "0.10.0"
 #define required_firmware_version_major 0
 #define required_firmware_version_minor 10
 #define required_firmware_version_patch 0
@@ -85,12 +88,20 @@ static std::shared_ptr<rawCloudRender> g_renderer = nullptr;
 std::string calib_file_ = "";
 static std::shared_ptr<odin_ros_driver::YamlParser> g_parser = nullptr;
 
-static constexpr size_t PTP_SMOOTH_WINDOW_SIZE = 30;
+static constexpr size_t PTP_SMOOTH_WINDOW_SIZE = 300;
 static std::mutex g_ptp_mutex;
 static std::deque<double> g_ptp_delay_buf;
 static std::deque<double> g_ptp_offset_buf;
 static std::atomic<double> g_ptp_delay_smooth{0.0};
 static std::atomic<double> g_ptp_offset_smooth{0.0};
+
+// IMU dedicated processing thread
+static std::atomic<bool> g_imu_thread_running(false);
+static std::thread g_imu_thread;
+static std::queue<imu_convert_data_t> g_imu_queue;
+static std::mutex g_imu_queue_mutex;
+static std::condition_variable g_imu_queue_cv;
+static const size_t IMU_QUEUE_MAX_SIZE = 200;
 
 double get_ptp_smoothed_delay() {
     return g_ptp_delay_smooth.load(std::memory_order_relaxed);
@@ -109,6 +120,10 @@ int g_sendimu = 1;
 int g_senddtof = 1;
 int g_sendodom = 1;
 int g_send_odom_baselink_tf = 0;
+
+// SDK IMU smooth sending configuration
+int g_enable_imu_smooth = 0;
+int g_imu_smooth_frequency = 400;
 int g_sendcloudslam = 0;
 int g_sendcloudrender = 0;
 int g_sendrgb_compressed = 0;
@@ -131,6 +146,11 @@ bool g_relocalization_success_msg_printed = false;
 std::string g_relocalization_map_abs_path = "";
 std::string g_mapping_result_dest_dir = "";
 std::string g_mapping_result_file_name = "";
+
+int g_send_image_mask = 0;
+std::string g_image_mask_abs_path = "";
+
+int g_reset_algo = 0;
 
 const char* DEV_STATUS_CSV_FILE = "dev_status.csv";
 FILE* dev_status_csv_file = nullptr;
@@ -764,6 +784,105 @@ void clear_all_queues() {
     g_latest_bgr.reset();
     g_latest_rgb_timestamp = 0;
     g_has_rgb = false;
+    
+    // Clear IMU queue
+    {
+        std::lock_guard<std::mutex> lock(g_imu_queue_mutex);
+        while (!g_imu_queue.empty()) {
+            g_imu_queue.pop();
+        }
+    }
+}
+
+// IMU dedicated processing thread routine
+static void imu_thread_routine()
+{
+    // Try to set higher thread priority for IMU processing
+    pthread_t this_thread = pthread_self();
+    struct sched_param param;
+    param.sched_priority = 70;
+    
+    int ret = pthread_setschedparam(this_thread, SCHED_FIFO, &param);
+    if (ret != 0) {
+        ret = pthread_setschedparam(this_thread, SCHED_RR, &param);
+    }
+    
+    #ifdef ROS2
+        RCLCPP_INFO(rclcpp::get_logger("imu_thread"), "IMU dedicated thread started (priority: %d)", param.sched_priority);
+    #else
+        ROS_INFO("IMU dedicated thread started (priority: %d)", param.sched_priority);
+    #endif
+    
+    while (g_imu_thread_running) {
+        std::unique_lock<std::mutex> lock(g_imu_queue_mutex);
+        
+        // Wait for IMU data
+        g_imu_queue_cv.wait(lock, []() {
+            return !g_imu_queue.empty() || !g_imu_thread_running;
+        });
+        
+        if (!g_imu_thread_running) {
+            break;
+        }
+        
+        // Process all pending IMU data
+        while (!g_imu_queue.empty() && g_imu_thread_running) {
+            imu_convert_data_t imu_data = g_imu_queue.front();
+            g_imu_queue.pop();
+            lock.unlock();
+            
+            // Publish IMU data
+            if (g_ros_object && g_sendimu) {
+                g_ros_object->publishImu(&imu_data);
+            }
+            
+            lock.lock();
+        }
+    }
+    
+    #ifdef ROS2
+        RCLCPP_INFO(rclcpp::get_logger("imu_thread"), "IMU dedicated thread exiting");
+    #else
+        ROS_INFO("IMU dedicated thread exiting");
+    #endif
+}
+
+// Start IMU dedicated thread
+static void start_imu_thread()
+{
+    if (!g_imu_thread_running) {
+        g_imu_thread_running = true;
+        g_imu_thread = std::thread(imu_thread_routine);
+        #ifdef ROS2
+            RCLCPP_INFO(rclcpp::get_logger("imu_thread"), "IMU dedicated thread created");
+        #else
+            ROS_INFO("IMU dedicated thread created");
+        #endif
+    }
+}
+
+// Stop IMU dedicated thread
+static void stop_imu_thread()
+{
+    if (g_imu_thread_running) {
+        g_imu_thread_running = false;
+        g_imu_queue_cv.notify_all();
+        if (g_imu_thread.joinable()) {
+            g_imu_thread.join();
+        }
+        
+        // Clear queue
+        std::lock_guard<std::mutex> lock(g_imu_queue_mutex);
+        while (!g_imu_queue.empty()) {
+            g_imu_queue.pop();
+        }
+        
+        #ifdef ROS2
+            RCLCPP_INFO(rclcpp::get_logger("imu_thread"), "IMU dedicated thread stopped");
+        #else
+            ROS_INFO("IMU dedicated thread stopped");
+        #endif
+    }
 }
 
 // Lidar data callback
@@ -800,7 +919,15 @@ static void lidar_data_callback(const lidar_data_t *data, void *user_data)
         case LIDAR_DT_RAW_IMU:
             if (g_sendimu) {
                 imudata = (imu_convert_data_t *)data->stream.imageList[0].pAddr;
-                g_ros_object->publishImu(imudata);
+                // Enqueue IMU data for dedicated thread processing
+                {
+                    std::lock_guard<std::mutex> lock(g_imu_queue_mutex);
+                    if (g_imu_queue.size() >= IMU_QUEUE_MAX_SIZE) {
+                        g_imu_queue.pop();  // Drop oldest if full
+                    }
+                    g_imu_queue.push(*imudata);
+                }
+                g_imu_queue_cv.notify_one();
             }
             update_count(&imu_rx_fps);
             break;
@@ -999,6 +1126,9 @@ static void lidar_data_callback(const lidar_data_t *data, void *user_data)
             break;
             case LIDAR_DT_SLAM_WIWC:
             {
+                // Always publish WIWC data for real-time extrinsics
+                g_ros_object->publishWiwc((capture_Image_List_t *)&data->stream);
+                
                 if(g_record_data ) {
                     g_ros_object->recordrotate((capture_Image_List_t *)&data->stream);
                 }
@@ -1451,6 +1581,51 @@ static void lidar_device_callback(const lidar_device_info_t* device, bool attach
                 return;
             }
         }
+
+        // Transfer image mask if enabled
+        if (g_send_image_mask == 1) {
+            if (g_image_mask_abs_path != "" && std::filesystem::exists(g_image_mask_abs_path)) {
+                int ret = lidar_set_image_mask(odinDevice, g_image_mask_abs_path.c_str());
+                if (ret == 0) {
+                    #ifdef ROS2
+                        RCLCPP_INFO(rclcpp::get_logger("device_cb"), "Image mask set successfully: %s", g_image_mask_abs_path.c_str());
+                    #else
+                        ROS_INFO("Image mask set successfully: %s", g_image_mask_abs_path.c_str());
+                    #endif
+                } else {
+                    #ifdef ROS2
+                        RCLCPP_ERROR(rclcpp::get_logger("device_cb"), "Failed to set image mask: %s, error: %d", g_image_mask_abs_path.c_str(), ret);
+                    #else
+                        ROS_ERROR("Failed to set image mask: %s, error: %d", g_image_mask_abs_path.c_str(), ret);
+                    #endif
+                }
+            } else {
+                #ifdef ROS2
+                    RCLCPP_WARN(rclcpp::get_logger("device_cb"), "Image mask path not set or file not found: %s", g_image_mask_abs_path.c_str());
+                #else
+                    ROS_WARN("Image mask path not set or file not found: %s", g_image_mask_abs_path.c_str());
+                #endif
+            }
+        }
+
+        // Send algo_reset command if enabled
+        if (g_reset_algo == 1) {
+            int reset_value = 1;
+            int ret = lidar_set_custom_parameter(odinDevice, "algo_reset", &reset_value, sizeof(int));
+            if (ret == 0) {
+                #ifdef ROS2
+                    RCLCPP_INFO(rclcpp::get_logger("device_cb"), "Algo reset command sent successfully");
+                #else
+                    ROS_INFO("Algo reset command sent successfully");
+                #endif
+            } else {
+                #ifdef ROS2
+                    RCLCPP_ERROR(rclcpp::get_logger("device_cb"), "Failed to send algo reset command, error: %d", ret);
+                #else
+                    ROS_ERROR("Failed to send algo reset command, error: %d", ret);
+                #endif
+            }
+        }
  
         lidar_data_callback_info_t data_callback_info;
         data_callback_info.data_callback = lidar_data_callback;
@@ -1532,6 +1707,9 @@ static void lidar_device_callback(const lidar_device_info_t* device, bool attach
         deviceConnected = true;
         deviceDisconnected = false;
         
+        // Start IMU dedicated thread
+        start_imu_thread();
+        
         // Start custom parameter monitoring thread
         g_param_monitor_running = true;
         g_param_monitor_thread = std::thread(custom_parameter_monitor);
@@ -1566,6 +1744,9 @@ static void lidar_device_callback(const lidar_device_info_t* device, bool attach
 
         deviceConnected = false;
         deviceDisconnected = true;
+        
+        // Stop IMU dedicated thread
+        stop_imu_thread();
         
         // Stop custom parameter monitoring thread
         g_param_monitor_running = false;
@@ -1647,6 +1828,10 @@ int main(int argc, char *argv[])
         g_sendrgb       = get_key_value("sendrgb", 1);
         g_sendimu       = get_key_value("sendimu", 1);
         g_senddtof      = get_key_value("senddtof", 1);
+        
+        // SDK IMU smooth sending configuration
+        g_enable_imu_smooth = get_key_value("enable_imu_smooth", 0);
+        g_imu_smooth_frequency = get_key_value("imu_smooth_frequency", 400);
         g_cloud_raw_confidence_threshold = get_key_value("cloud_raw_confidence_threshold", 35);
         g_rosNodeControlImpl.setCloudRawConfidenceThreshold(g_cloud_raw_confidence_threshold);
         g_dtof_fps      = get_key_value("dtof_fps", 145);  // Read DTOF frame rate from config (100=10fps, 145=14.5fps)
@@ -1679,7 +1864,10 @@ int main(int argc, char *argv[])
         g_relocalization_map_abs_path = get_key_str_value("relocalization_map_abs_path", "");
         g_mapping_result_dest_dir = get_key_str_value("mapping_result_dest_dir", "");
         g_mapping_result_file_name = get_key_str_value("mapping_result_file_name", "");
+        g_image_mask_abs_path = get_key_str_value("image_mask_abs_path", "");
 
+        g_send_image_mask = get_key_value("sendimagemask", 0);
+        g_reset_algo = get_key_value("resetalgo", 0);
         g_custom_map_mode = g_parser->getCustomMapMode(2);
 
         lidar_log_set_level(LIDAR_LOG_INFO);
@@ -1745,6 +1933,24 @@ int main(int argc, char *argv[])
                 ROS_ERROR("Lidar system init failed");
             #endif
             return -1;
+        }
+        
+        // Configure SDK IMU smooth sending AFTER lidar_system_init
+        // SDK now defaults to disabled, only enable if configured
+        if (g_enable_imu_smooth) {
+            lidar_enable_imu_smooth_sending(1);
+            lidar_set_imu_smooth_frequency(g_imu_smooth_frequency);
+            #ifdef ROS2
+                RCLCPP_INFO(node->get_logger(), "Enabling SDK IMU smooth sending at %d Hz", g_imu_smooth_frequency);
+            #else
+                ROS_INFO("Enabling SDK IMU smooth sending at %d Hz", g_imu_smooth_frequency);
+            #endif
+        } else {
+            #ifdef ROS2
+                RCLCPP_INFO(node->get_logger(), "SDK IMU smooth sending disabled");
+            #else
+                ROS_INFO("SDK IMU smooth sending disabled");
+            #endif
         }
         
 
